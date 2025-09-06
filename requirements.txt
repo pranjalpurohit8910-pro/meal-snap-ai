@@ -6,3 +6,5 @@ requests
 matplotlib
 ultralytics
 opencv-python-headless
+torch
+torchvision
