@@ -5,4 +5,4 @@ pillow
 requests
 matplotlib
 ultralytics
-
+opencv-python-headless
