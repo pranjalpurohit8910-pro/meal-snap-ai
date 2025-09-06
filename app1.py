@@ -8,6 +8,16 @@ import cv2
 from PIL import Image
 import numpy as np
 
+# ------------------
+# Page Config
+# ------------------
+st.set_page_config(
+    page_title="🍽️ MealSnap AI – Nutrition Estimator",
+    page_icon="🍎",
+    layout="wide"
+)
+
+
 # --------------------------
 # Background
 # --------------------------
@@ -132,3 +142,13 @@ elif option == "Camera":
                 break
         else:
             st.warning("⚠️ No recognizable food detected. Try again.")
+
+# Credits
+st.markdown(
+    """
+    <div style="text-align: center; margin-top: 50px; font-size: 14px; color: grey;">
+        © Made by <b>Pranjal Purohit</b>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
