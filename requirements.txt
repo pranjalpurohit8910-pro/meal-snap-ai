@@ -1,10 +1,9 @@
 streamlit
-opencv-python
-numpy
-pillow
-requests
-matplotlib
 ultralytics
 opencv-python-headless
+numpy
+Pillow
+requests
+matplotlib
 torch
 torchvision
