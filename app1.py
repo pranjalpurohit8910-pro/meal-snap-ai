@@ -8,12 +8,11 @@ import cv2
 from PIL import Image
 import numpy as np
 
-# ------------------
-# Page Config
-# ------------------
+
+# Page Title
 st.set_page_config(
-    page_title="🍽️ MealSnap AI – Nutrition Estimator",
-    page_icon="🍎",
+    page_title="MealSnap AI – Smart Nutrition Estimator",
+    page_icon="🍽️",
     layout="wide"
 )
 
@@ -38,7 +37,7 @@ def add_bg_from_local(image_file):
         unsafe_allow_html=True
     )
 
-add_bg_from_local("bg.png")   # your background image
+add_bg_from_local("bg.png")
 
 
 # --------------------------
@@ -52,7 +51,6 @@ APP_KEY = "49fa98e3b702be8cf3bd51d5ffdc5a67"
 # Nutrition Function
 # --------------------------
 def get_nutrition(food_item):
-    """Fetch nutrition info from Edamam API and display results"""
     url = f"https://api.edamam.com/api/nutrition-data?app_id={APP_ID}&app_key={APP_KEY}&ingr={food_item}"
     response = requests.get(url).json()
 
@@ -64,12 +62,23 @@ def get_nutrition(food_item):
         carbs = nutrients["CHOCDF"]["quantity"]
         fat = nutrients["FAT"]["quantity"]
 
-        # Display results
-        st.subheader(f"Nutrition for: {food_item}")
-        st.write(f"**Calories:** {calories:.2f} kcal")
-        st.write(f"**Protein:** {protein:.2f} g")
-        st.write(f"**Carbs:** {carbs:.2f} g")
-        st.write(f"**Fat:** {fat:.2f} g")
+        # Display results inside black box
+        st.markdown(
+            f"""
+            <div style="background-color: rgba(0, 0, 0, 0.7); 
+                        padding: 20px; 
+                        border-radius: 10px; 
+                        color: white;
+                        margin-bottom: 20px;">
+                <h2>Nutrition for: {food_item}</h2>
+                <p><b>Calories:</b> {calories:.2f} kcal</p>
+                <p><b>Protein:</b> {protein:.2f} g</p>
+                <p><b>Carbs:</b> {carbs:.2f} g</p>
+                <p><b>Fat:</b> {fat:.2f} g</p>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
         # Visualization
         data = {
@@ -84,8 +93,51 @@ def get_nutrition(food_item):
         ax.set_title("Nutritional Breakdown")
         st.pyplot(fig)
 
+        return {
+            "calories": calories,
+            "protein": protein,
+            "carbs": carbs,
+            "fat": fat
+        }
+
     except Exception:
         st.error("⚠️ Could not fetch nutrition info. Try rephrasing (e.g., '100g chicken').")
+        return None
+
+
+# --------------------------
+# Suggest Additions Function
+# --------------------------
+def suggest_additions(nutrition):
+    suggestions = []
+
+    if nutrition["protein"] < 20:
+        suggestions.append("🍳 Add a boiled egg to boost protein.")
+    if nutrition["fat"] < 10:
+        suggestions.append("🥑 Add some avocado for healthy fats.")
+    if nutrition["carbs"] < 30:
+        suggestions.append("🍞 Add a slice of whole grain bread for more carbs.")
+    if nutrition["calories"] < 300:
+        suggestions.append("🥗 Add a small salad to increase calories.")
+
+    if suggestions:
+        st.markdown(
+            """
+            <div style="background-color: rgba(0, 0, 0, 0.7); 
+                        padding: 15px; 
+                        border-radius: 10px; 
+                        color: white;
+                        margin-bottom: 20px;">
+                <h3>💡 Suggestions to improve your meal:</h3>
+            """,
+            unsafe_allow_html=True
+        )
+        for s in suggestions:
+            st.markdown(f"- {s}", unsafe_allow_html=True)
+
+        st.markdown("</div>", unsafe_allow_html=True)
+    else:
+        st.success("✅ Your meal looks balanced!")
 
 
 # --------------------------
@@ -93,7 +145,7 @@ def get_nutrition(food_item):
 # --------------------------
 @st.cache_resource
 def load_model():
-    return YOLO("yolov8n.pt")  # replace with custom food-trained weights if available
+    return YOLO("yolov8n.pt")  # Replace with custom food-trained weights if available
 
 model = load_model()
 
@@ -113,7 +165,9 @@ if option == "Search Bar":
         if food_item.strip() == "":
             st.warning("⚠️ Please enter a food item with quantity.")
         else:
-            get_nutrition(food_item)
+            nutrition = get_nutrition(food_item)
+            if nutrition:
+                suggest_additions(nutrition)
 
 
 # --- Camera Input ---
@@ -121,11 +175,9 @@ elif option == "Camera":
     uploaded_img = st.camera_input("📸 Take a picture of your food")
 
     if uploaded_img is not None:
-        # Convert to OpenCV image
         image = Image.open(uploaded_img)
         img_array = np.array(image)
 
-        # YOLO Prediction
         results = model.predict(img_array, conf=0.5)
         detected_items = set()
         for r in results:
@@ -135,15 +187,17 @@ elif option == "Camera":
         if detected_items:
             st.success(f"Detected: {', '.join(detected_items)}")
 
-            # Add "1" quantity by default
             for item in detected_items:
-                food_with_qty = f"1 {item}"   # <-- FIX HERE
+                food_with_qty = f"1 {item}"
                 get_nutrition(food_with_qty)
                 break
         else:
             st.warning("⚠️ No recognizable food detected. Try again.")
 
-# Credits
+
+# --------------------------
+# Credits / Watermark
+# --------------------------
 st.markdown(
     """
     <div style="text-align: center; margin-top: 50px; font-size: 14px; color: grey;">
