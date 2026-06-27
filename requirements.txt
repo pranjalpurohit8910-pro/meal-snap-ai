@@ -1,9 +1,6 @@
 streamlit
-ultralytics
-opencv-python-headless
-numpy
-Pillow
 requests
+pandas
 matplotlib
-torch
-torchvision
+google-generativeai
+Pillow
