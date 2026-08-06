@@ -49,7 +49,7 @@ EDAMAM_APP_ID  = "e9755876"
 EDAMAM_APP_KEY = "49fa98e3b702be8cf3bd51d5ffdc5a67"
 
 # ==============================================================
-# GEMINI MODEL  (free tier: 15 RPM · 1,500 req/day · no card)
+# GEMINI MODEL  
 # ==============================================================
 @st.cache_resource
 def get_gemini_model():
@@ -249,12 +249,28 @@ def suggest_additions(total: dict, food_context: str):
                   e.g. "2 apples, 1 banana" or "1 cup dal, 2 chapatis"
     """
     genai.configure(api_key=GOOGLE_API_KEY)
+
+    # gemini-2.5-flash is a "thinking" model — internal reasoning tokens are
+    # drawn from the SAME max_output_tokens budget, BEFORE the visible answer
+    # is written. If reasoning eats the whole budget, response.text comes back
+    # empty/blocked, which is why every call was failing. We try to disable
+    # thinking outright; if the installed SDK version doesn't support that yet,
+    # we fall back to a much larger token budget as a safety cushion.
+    try:
+        gen_config = genai.types.GenerationConfig(
+            temperature=0.7,
+            max_output_tokens=2048,
+            thinking_config=genai.types.ThinkingConfig(thinking_budget=0),
+        )
+    except (AttributeError, TypeError):
+        gen_config = genai.types.GenerationConfig(
+            temperature=0.7,
+            max_output_tokens=2048,
+        )
+
     suggestion_model = genai.GenerativeModel(
         model_name="gemini-2.5-flash",
-        generation_config=genai.types.GenerationConfig(
-            temperature=0.7,       # slightly creative for natural suggestions
-            max_output_tokens=600,
-        ),
+        generation_config=gen_config,
     )
 
     # Build a clear nutritional-gap summary for the prompt
@@ -282,32 +298,55 @@ Nutritional gaps in their meal: {gap_text}
 
 Your task:
 1. Identify the food category of their meal (e.g. fruits only, vegetarian Indian, non-vegetarian, vegan, mixed, etc.)
-2. Suggest 3–5 specific additions that:
+2. Suggest EXACTLY 3 to 5 specific additions (never fewer than 3, never more than 5) that:
    - Belong to the SAME food category (e.g. if they ate only fruits, suggest fruits or foods naturally eaten with fruits like yogurt, nuts, seeds — NOT eggs, bread, or meat)
    - Directly address the nutritional gaps listed above
    - Are realistic and practical to add to that meal
-   - Include a short reason why each helps (one sentence)
+   - Include a SHORT reason why each helps — ONE sentence, under 15 words, to keep the response compact
 
-Format your response as a JSON array ONLY — no markdown, no extra text:
+Respond with ONLY the JSON array below. No reasoning, no explanation, no markdown fences, no text before or after:
 [
-  {{"suggestion": "Add a handful of almonds", "reason": "Almonds are rich in healthy fats and complement a fruit meal perfectly.", "emoji": "🌰"}},
-  {{"suggestion": "Add a small bowl of Greek yogurt", "reason": "Greek yogurt pairs well with fruits and adds 10g of protein.", "emoji": "🥛"}}
+  {{"suggestion": "Add a handful of almonds", "reason": "Rich in healthy fats, complements a fruit meal.", "emoji": "🌰"}},
+  {{"suggestion": "Add a small bowl of Greek yogurt", "reason": "Pairs well with fruit and adds 10g protein.", "emoji": "🥛"}}
 ]"""
 
-    try:
-        response = suggestion_model.generate_content(prompt)
-        raw = response.text.strip()
+    def get_response_text(response):
+        """Safely pull text out of a response, with a clear reason if it's missing."""
+        try:
+            text = response.text
+            if not text or not text.strip():
+                raise ValueError("Empty response text")
+            return text
+        except (ValueError, AttributeError, IndexError):
+            candidate = response.candidates[0] if getattr(response, "candidates", None) else None
+            finish_reason = getattr(candidate, "finish_reason", "UNKNOWN") if candidate else "NO_CANDIDATES"
+            raise ValueError(f"no_text:{finish_reason}")
 
-        if raw.startswith("```"):
-            parts = raw.split("```")
-            raw = parts[1] if len(parts) > 1 else parts[0]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        raw = raw.strip()
+    def try_parse(raw_text):
+        raw_text = raw_text.strip()
+        if raw_text.startswith("```"):
+            parts = raw_text.split("```")
+            raw_text = parts[1] if len(parts) > 1 else parts[0]
+            if raw_text.lower().startswith("json"):
+                raw_text = raw_text[4:]
+        raw_text = raw_text.strip()
 
-        suggestions = json.loads(raw)
+        parsed = json.loads(raw_text)  # raises JSONDecodeError if malformed/truncated
 
-        # Render the suggestion cards
+        if not isinstance(parsed, list):
+            raise ValueError("Response was not a JSON list")
+
+        parsed = parsed[:5]
+        if len(parsed) < 3:
+            raise ValueError(f"Only received {len(parsed)} suggestion(s), need at least 3")
+
+        for item in parsed:
+            if "suggestion" not in item or "reason" not in item:
+                raise KeyError("Missing required fields in a suggestion item")
+
+        return parsed
+
+    def render_suggestions(suggestions):
         st.markdown(
             """
             <div style="background-color:rgba(0,0,0,0.70);
@@ -336,20 +375,30 @@ Format your response as a JSON array ONLY — no markdown, no extra text:
             )
         st.markdown("</div>", unsafe_allow_html=True)
 
-    except (json.JSONDecodeError, KeyError):
-        # Graceful fallback: show raw text if JSON parsing fails
-        st.markdown(
-            f"""
-            <div style="background-color:rgba(0,0,0,0.70);
-                        padding:16px 20px; border-radius:12px;
-                        color:white; margin-bottom:20px;
-                        border-left:4px solid #ffeb3b;">
-                <h3 style="margin:0 0 10px 0;">💡 Suggestions</h3>
-                <p>{response.text}</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    last_error = None
+
+    try:
+        response = suggestion_model.generate_content(prompt)
+        raw_text = get_response_text(response)
+        suggestions = try_parse(raw_text)
+        render_suggestions(suggestions)
+
+    except (json.JSONDecodeError, KeyError, ValueError) as e:
+        last_error = str(e)
+        try:
+            retry_prompt = prompt + "\n\nIMPORTANT: Keep the entire JSON response under 400 words total."
+            retry_response = suggestion_model.generate_content(retry_prompt)
+            retry_raw = get_response_text(retry_response)
+            suggestions = try_parse(retry_raw)
+            render_suggestions(suggestions)
+        except Exception as e2:
+            last_error = str(e2)
+            st.warning("⚠️ Couldn't generate clean suggestions this time — please try again.")
+            # Plain-text diagnostic only (no raw JSON/braces shown) — safe to leave in
+            # while debugging; remove this expander once things look stable.
+            with st.expander("Debug details"):
+                st.write(f"Reason: {last_error}")
+
     except Exception as e:
         st.warning(f"⚠️ Could not generate personalized suggestions: {e}")
 
@@ -402,7 +451,7 @@ elif option == "📸 Camera / Upload":
             )
             st.stop()
 
-        with st.spinner("🤖 Gemini Vision is analysing your food..."):
+        with st.spinner("🤖 Meal Snap AI is analysing your food..."):
             try:
                 detected_foods = detect_food_with_gemini(image)
             except json.JSONDecodeError:
