@@ -44,7 +44,6 @@ add_bg_from_local("bg.png")
 # ==============================================================
 # API KEYS
 # ==============================================================
-GOOGLE_API_KEY = "AQ.Ab8RN6Lz6dnW4qUABnM5Av_DJ_FqhAtsGZS9U72nJKPiRdLznQ"
 EDAMAM_APP_ID  = "e9755876"
 EDAMAM_APP_KEY = "49fa98e3b702be8cf3bd51d5ffdc5a67"
 
@@ -53,7 +52,7 @@ EDAMAM_APP_KEY = "49fa98e3b702be8cf3bd51d5ffdc5a67"
 # ==============================================================
 @st.cache_resource
 def get_gemini_model():
-    genai.configure(api_key=GOOGLE_API_KEY)
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
     return genai.GenerativeModel(
         model_name="gemini-2.5-flash",
         generation_config=genai.types.GenerationConfig(
