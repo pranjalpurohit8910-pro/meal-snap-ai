@@ -7,6 +7,7 @@ import os
 import time
 import random
 import textwrap
+from html import escape as html_escape
 from google import genai
 from google.genai import types
 from PIL import Image
@@ -26,14 +27,28 @@ st.set_page_config(
 # ==============================================================
 # HTML RENDER HELPER
 # --------------------------------------------------------------
-# IMPORTANT: st.markdown(unsafe_allow_html=True) still runs the
-# string through a Markdown parser first. If the HTML inside a
-# triple-quoted f-string is indented (to match your Python code),
-# Markdown sees 4+ leading spaces and treats it as a CODE BLOCK
-# instead of parsing it as HTML — which is exactly why you were
-# seeing raw <div> tags printed on the page instead of styled
-# boxes. textwrap.dedent() strips that shared indentation before
-# it reaches the Markdown parser, so it's rendered as real HTML.
+# WHY THIS MATTERS (confirmed by testing the exact remark/rehype
+# pipeline Streamlit's frontend uses):
+#
+# st.markdown(unsafe_allow_html=True) still runs the string
+# through a Markdown parser before rendering it as HTML. Two
+# separate things break that parsing:
+#
+#   1. Leading indentation (4+ spaces) on a line that starts a
+#      new block gets read as a Markdown "indented code block",
+#      not as HTML.
+#   2. A BLANK LINE inside a raw HTML block ends that block. Any
+#      indented content that follows (nested tags like <h3>,
+#      <table>, <span>) then gets treated as a *fresh* block —
+#      and rule #1 kicks in on it again, turning your nested tags
+#      into visible literal text even after the outer <div> is
+#      fixed.
+#
+# The reliable fix is to build each HTML fragment as ONE single
+# line, with no blank lines and no indentation at all, so there's
+# nothing for the Markdown parser to misinterpret. render_html()
+# still dedents as a safety net, but the real fix is that every
+# card below is now assembled as a single-line string.
 # ==============================================================
 
 def render_html(html: str):
@@ -49,18 +64,16 @@ def add_bg_from_local(image_file):
         with open(image_file, "rb") as file:
             encoded_string = base64.b64encode(file.read()).decode()
 
-        render_html(
-            f"""
-            <style>
-            .stApp {{
-                background-image: url("data:image/png;base64,{encoded_string}");
-                background-size: cover;
-                background-position: center;
-                background-attachment: fixed;
-            }}
-            </style>
-            """
+        style_html = (
+            '<style>.stApp{'
+            f'background-image:url("data:image/png;base64,{encoded_string}");'
+            'background-size:cover;'
+            'background-position:center;'
+            'background-attachment:fixed;'
+            '}</style>'
         )
+
+        render_html(style_html)
 
 
 add_bg_from_local("bg.png")
@@ -313,6 +326,116 @@ Required JSON format:
 
 
 # ==============================================================
+# HTML CARD BUILDERS
+# --------------------------------------------------------------
+# Each of these returns ONE single-line HTML string (see the
+# render_html() docstring above for why that matters). Any text
+# that came from the user or from Gemini is passed through
+# html_escape() first, so a stray "<", ">", "&" or quote in a
+# food name or suggestion can't break the markup.
+# ==============================================================
+
+def build_nutrition_card_html(display_name, calories, protein, carbs, fat, fiber):
+    name = html_escape(str(display_name))
+
+    rows = [
+        ("🔥 <b>Calories</b>", f"<b>{calories:.1f} kcal</b>"),
+        ("💪 <b>Protein</b>", f"{protein:.1f} g"),
+        ("🌾 <b>Carbs</b>", f"{carbs:.1f} g"),
+        ("🧈 <b>Fat</b>", f"{fat:.1f} g"),
+        ("🌿 <b>Fiber</b>", f"{fiber:.1f} g"),
+    ]
+
+    rows_html = "".join(
+        f"<tr><td>{label}</td><td>{value}</td></tr>"
+        for label, value in rows
+    )
+
+    return (
+        '<div style="background-color:rgba(0,0,0,0.72);padding:18px 22px;'
+        'border-radius:12px;color:white;margin-bottom:16px;'
+        'border-left:4px solid #f0a500;">'
+        f'<h3 style="margin:0 0 10px 0;">🍴 {name}</h3>'
+        f'<table style="width:100%;font-size:15px;">{rows_html}</table>'
+        '</div>'
+    )
+
+
+def build_meal_summary_html(total: dict):
+    rows = [
+        ("🔥 <b>Total Calories</b>", f"<b>{total['calories']:.1f} kcal</b>"),
+        ("💪 <b>Total Protein</b>", f"{total['protein']:.1f} g"),
+        ("🌾 <b>Total Carbs</b>", f"{total['carbs']:.1f} g"),
+        ("🧈 <b>Total Fat</b>", f"{total['fat']:.1f} g"),
+        ("🌿 <b>Total Fiber</b>", f"{total['fiber']:.1f} g"),
+    ]
+
+    rows_html = "".join(
+        f"<tr><td>{label}</td><td>{value}</td></tr>"
+        for label, value in rows
+    )
+
+    return (
+        '<div style="background-color:rgba(0,100,0,0.75);padding:20px 24px;'
+        'border-radius:12px;color:white;margin:20px 0;'
+        'border-left:4px solid #00e676;">'
+        '<h2 style="margin:0 0 12px 0;">📊 Total Meal Summary</h2>'
+        f'<table style="width:100%;font-size:16px;">{rows_html}</table>'
+        '</div>'
+    )
+
+
+def build_suggestions_header_html():
+    return (
+        '<div style="background-color:rgba(0,0,0,0.70);padding:16px 20px;'
+        'border-radius:12px;color:white;margin-bottom:10px;'
+        'border-left:4px solid #ffeb3b;">'
+        '<h3 style="margin:0;">💡 Personalized Suggestions</h3>'
+        '</div>'
+    )
+
+
+def build_suggestion_card_html(emoji, title, reason):
+    emoji = html_escape(str(emoji))
+    title = html_escape(str(title))
+    reason = html_escape(str(reason))
+
+    return (
+        '<div style="margin:8px 0;padding:10px 14px;'
+        'background:rgba(0,0,0,0.65);border-radius:8px;color:white;">'
+        f'<span style="font-size:18px;">{emoji}</span> '
+        f'<b>{title}</b>'
+        '<br>'
+        f'<span style="font-size:13px;color:#ddd;">{reason}</span>'
+        '</div>'
+    )
+
+
+def build_detected_food_html(item, count, serving):
+    item = html_escape(str(item))
+    serving = html_escape(str(serving))
+
+    return (
+        '<div style="background-color:rgba(0,0,0,0.60);padding:10px 16px;'
+        'border-radius:8px;color:white;margin:5px 0;'
+        'border-left:3px solid #f0a500;">'
+        f'🍴 <b>{item}</b> &nbsp;|&nbsp; '
+        f'Qty: <b>{count}</b> &nbsp;|&nbsp; '
+        f'Serving: <i>{serving}</i>'
+        '</div>'
+    )
+
+
+def build_credits_html():
+    return (
+        '<div style="text-align:center;margin-top:30px;'
+        'font-size:13px;color:grey;">'
+        '© Made by <b>Pranjal Purohit</b>'
+        '</div>'
+    )
+
+
+# ==============================================================
 # NUTRITION — EDAMAM API
 # ==============================================================
 
@@ -382,51 +505,9 @@ def get_nutrition(serving_query: str, display_name: str = None):
         ).get("quantity", 0)
 
         render_html(
-            f"""
-            <div style="
-                background-color:rgba(0,0,0,0.72);
-                padding:18px 22px;
-                border-radius:12px;
-                color:white;
-                margin-bottom:16px;
-                border-left:4px solid #f0a500;
-            ">
-
-                <h3 style="margin:0 0 10px 0;">
-                    🍴 {display_name}
-                </h3>
-
-                <table style="width:100%; font-size:15px;">
-
-                    <tr>
-                        <td>🔥 <b>Calories</b></td>
-                        <td><b>{calories:.1f} kcal</b></td>
-                    </tr>
-
-                    <tr>
-                        <td>💪 <b>Protein</b></td>
-                        <td>{protein:.1f} g</td>
-                    </tr>
-
-                    <tr>
-                        <td>🌾 <b>Carbs</b></td>
-                        <td>{carbs:.1f} g</td>
-                    </tr>
-
-                    <tr>
-                        <td>🧈 <b>Fat</b></td>
-                        <td>{fat:.1f} g</td>
-                    </tr>
-
-                    <tr>
-                        <td>🌿 <b>Fiber</b></td>
-                        <td>{fiber:.1f} g</td>
-                    </tr>
-
-                </table>
-
-            </div>
-            """
+            build_nutrition_card_html(
+                display_name, calories, protein, carbs, fat, fiber
+            )
         )
 
         # ------------------------------------------------------
@@ -559,55 +640,7 @@ def show_meal_summary(nutrition_list: list):
         )
     }
 
-    render_html(
-        f"""
-        <div style="
-            background-color:rgba(0,100,0,0.75);
-            padding:20px 24px;
-            border-radius:12px;
-            color:white;
-            margin:20px 0;
-            border-left:4px solid #00e676;
-        ">
-
-            <h2 style="margin:0 0 12px 0;">
-                📊 Total Meal Summary
-            </h2>
-
-            <table style="width:100%; font-size:16px;">
-
-                <tr>
-                    <td>🔥 <b>Total Calories</b></td>
-                    <td>
-                        <b>{total['calories']:.1f} kcal</b>
-                    </td>
-                </tr>
-
-                <tr>
-                    <td>💪 <b>Total Protein</b></td>
-                    <td>{total['protein']:.1f} g</td>
-                </tr>
-
-                <tr>
-                    <td>🌾 <b>Total Carbs</b></td>
-                    <td>{total['carbs']:.1f} g</td>
-                </tr>
-
-                <tr>
-                    <td>🧈 <b>Total Fat</b></td>
-                    <td>{total['fat']:.1f} g</td>
-                </tr>
-
-                <tr>
-                    <td>🌿 <b>Total Fiber</b></td>
-                    <td>{total['fiber']:.1f} g</td>
-                </tr>
-
-            </table>
-
-        </div>
-        """
-    )
+    render_html(build_meal_summary_html(total))
 
     # ----------------------------------------------------------
     # MACRO PIE CHART
@@ -865,60 +898,16 @@ Required format:
         # DISPLAY SUGGESTIONS
         # ------------------------------------------------------
 
-        render_html(
-            """
-            <div style="
-                background-color:rgba(0,0,0,0.70);
-                padding:16px 20px;
-                border-radius:12px;
-                color:white;
-                margin-bottom:10px;
-                border-left:4px solid #ffeb3b;
-            ">
-
-                <h3 style="margin:0;">
-                    💡 Personalized Suggestions
-                </h3>
-
-            </div>
-            """
-        )
+        render_html(build_suggestions_header_html())
 
         for suggestion in valid_suggestions:
 
-            emoji = suggestion["emoji"]
-            title = suggestion["suggestion"]
-            reason = suggestion["reason"]
-
             render_html(
-                f"""
-                <div style="
-                    margin:8px 0;
-                    padding:10px 14px;
-                    background:rgba(0,0,0,0.65);
-                    border-radius:8px;
-                    color:white;
-                ">
-
-                    <span style="font-size:18px;">
-                        {emoji}
-                    </span>
-
-                    <b>
-                        {title}
-                    </b>
-
-                    <br>
-
-                    <span style="
-                        font-size:13px;
-                        color:#ddd;
-                    ">
-                        {reason}
-                    </span>
-
-                </div>
-                """
+                build_suggestion_card_html(
+                    suggestion["emoji"],
+                    suggestion["suggestion"],
+                    suggestion["reason"],
+                )
             )
 
     except json.JSONDecodeError:
@@ -1187,36 +1176,9 @@ Tips:
             for food in detected_foods:
 
                 render_html(
-                    f"""
-                    <div style="
-                        background-color:rgba(0,0,0,0.60);
-                        padding:10px 16px;
-                        border-radius:8px;
-                        color:white;
-                        margin:5px 0;
-                        border-left:3px solid #f0a500;
-                    ">
-
-                        🍴 <b>
-                            {food['item']}
-                        </b>
-
-                        &nbsp;|&nbsp;
-
-                        Qty:
-                        <b>
-                            {food['count']}
-                        </b>
-
-                        &nbsp;|&nbsp;
-
-                        Serving:
-                        <i>
-                            {food['serving']}
-                        </i>
-
-                    </div>
-                    """
+                    build_detected_food_html(
+                        food["item"], food["count"], food["serving"]
+                    )
                 )
 
             st.markdown("---")
@@ -1292,15 +1254,4 @@ Tips:
 # CREDITS
 # ==============================================================
 
-render_html(
-    """
-    <div style="
-        text-align:center;
-        margin-top:30px;
-        font-size:13px;
-        color:grey;
-    ">
-        © Made by <b>Pranjal Purohit</b>
-    </div>
-    """
-)
+render_html(build_credits_html())
