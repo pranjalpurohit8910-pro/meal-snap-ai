@@ -54,7 +54,7 @@ EDAMAM_APP_KEY = "49fa98e3b702be8cf3bd51d5ffdc5a67"
 def get_gemini_model():
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
     return genai.GenerativeModel(
-        model_name="gemini-2.5-flash",
+        model_name="models/gemini-3.5-flash",
         generation_config=genai.types.GenerationConfig(
             temperature=0.2,
             max_output_tokens=800,
