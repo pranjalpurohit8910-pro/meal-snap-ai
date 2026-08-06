@@ -309,7 +309,7 @@ Return ONLY valid JSON:
 
     try:
         response = client.models.generate_content(
-            model="YOUR_AVAILABLE_MODEL",
+            model="gemini-2.5-flash",
             contents=prompt
         )
 
