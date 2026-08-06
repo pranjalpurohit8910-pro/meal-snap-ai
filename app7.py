@@ -2,11 +2,13 @@ import streamlit as st
 import requests
 import matplotlib.pyplot as plt
 import base64
-from google import genai
 import json
 import os
 import time
-import html
+import random
+import textwrap
+from google import genai
+from google.genai import types
 from PIL import Image
 
 
@@ -22,37 +24,54 @@ st.set_page_config(
 
 
 # ==============================================================
+# HTML RENDER HELPER
+# --------------------------------------------------------------
+# IMPORTANT: st.markdown(unsafe_allow_html=True) still runs the
+# string through a Markdown parser first. If the HTML inside a
+# triple-quoted f-string is indented (to match your Python code),
+# Markdown sees 4+ leading spaces and treats it as a CODE BLOCK
+# instead of parsing it as HTML — which is exactly why you were
+# seeing raw <div> tags printed on the page instead of styled
+# boxes. textwrap.dedent() strips that shared indentation before
+# it reaches the Markdown parser, so it's rendered as real HTML.
+# ==============================================================
+
+def render_html(html: str):
+    st.markdown(textwrap.dedent(html), unsafe_allow_html=True)
+
+
+# ==============================================================
 # BACKGROUND
 # ==============================================================
 
 def add_bg_from_local(image_file):
     if os.path.exists(image_file):
-        try:
-            with open(image_file, "rb") as file:
-                encoded_string = base64.b64encode(file.read()).decode()
+        with open(image_file, "rb") as file:
+            encoded_string = base64.b64encode(file.read()).decode()
 
-            css = f"""
-<style>
-.stApp {{
-    background-image: url("data:image/png;base64,{encoded_string}");
-    background-size: cover;
-    background-position: center;
-    background-attachment: fixed;
-}}
-</style>
-"""
-            st.markdown(css, unsafe_allow_html=True)
-
-        except Exception as e:
-            print(f"Background image error: {e}")
+        render_html(
+            f"""
+            <style>
+            .stApp {{
+                background-image: url("data:image/png;base64,{encoded_string}");
+                background-size: cover;
+                background-position: center;
+                background-attachment: fixed;
+            }}
+            </style>
+            """
+        )
 
 
 add_bg_from_local("bg.png")
 
 
 # ==============================================================
-# STREAMLIT SECRETS
+# API KEYS
 # ==============================================================
+
+# Never hardcode API keys here.
+# Store all credentials in Streamlit Cloud → Settings → Secrets.
 
 try:
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
@@ -61,9 +80,10 @@ try:
 
 except KeyError as e:
     st.error(
-        "❌ Required API credentials are missing from Streamlit Secrets."
+        f"❌ Missing secret: {e}\n\n"
+        "Add GEMINI_API_KEY, EDAMAM_APP_ID and EDAMAM_APP_KEY "
+        "to Streamlit Secrets."
     )
-    print(f"Missing Streamlit secret: {e}")
     st.stop()
 
 
@@ -71,14 +91,10 @@ except KeyError as e:
 # GEMINI CONFIGURATION
 # ==============================================================
 
-# Models confirmed available to your API key.
-# If one model returns 503/high demand, the next one is tried.
-
-GEMINI_MODELS = [
-    "models/gemini-3.5-flash",
-    "models/gemini-3.6-flash",
-    "models/gemini-3.5-flash-lite",
-]
+# Primary model, plus a lighter fallback used only if the primary
+# keeps returning 503 (server overloaded) after a few retries.
+GEMINI_PRIMARY_MODEL = "gemini-3.5-flash"
+GEMINI_FALLBACK_MODEL = "gemini-3.5-flash-lite"
 
 
 @st.cache_resource
@@ -88,110 +104,95 @@ def get_gemini_client():
     )
 
 
-# ==============================================================
-# GEMINI FALLBACK
-# ==============================================================
-
-def generate_with_fallback(contents):
+@st.cache_resource
+def get_fast_config():
     """
-    Try Gemini models in sequence.
+    Gemini 3.x models replaced the old numeric `thinking_budget`
+    with a `thinking_level` string enum. "low" keeps latency and
+    token spend down for these fairly simple, structured tasks
+    (JSON food detection / JSON suggestions) without the model
+    silently spending its whole budget "thinking" before answering.
 
-    Temporary 429/503/capacity errors cause the app to
-    automatically try another available model.
+    Falls back gracefully if an older installed SDK version
+    doesn't recognise thinking_level yet.
+    """
+    try:
+        return types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_level="low")
+        )
+    except TypeError:
+        try:
+            return types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(thinking_budget=0)
+            )
+        except TypeError:
+            return None
+
+
+def _is_overloaded_error(err: Exception) -> bool:
+    msg = str(err).lower()
+    return "503" in msg or "unavailable" in msg or "overloaded" in msg
+
+
+def generate_with_retry(contents, max_retries: int = 3):
+    """
+    Calls Gemini with exponential-backoff retries on transient
+    503 "high demand" errors, then falls back to a lighter model
+    if the primary model is still overloaded after all retries.
+    Non-overload errors (bad API key, quota, etc.) are raised
+    immediately without wasting retries.
     """
 
     client = get_gemini_client()
+    config = get_fast_config()
 
     last_error = None
 
-    for model_name in GEMINI_MODELS:
+    for model_name in (GEMINI_PRIMARY_MODEL, GEMINI_FALLBACK_MODEL):
 
-        # Two attempts per model for temporary service issues.
-        for attempt in range(2):
-
+        for attempt in range(max_retries):
             try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=contents
-                )
+                kwargs = {"model": model_name, "contents": contents}
+                if config is not None:
+                    kwargs["config"] = config
 
-                if response and response.text:
-                    if response.text.strip():
-                        return response
-
-                last_error = RuntimeError(
-                    f"{model_name} returned an empty response."
-                )
+                return client.models.generate_content(**kwargs)
 
             except Exception as e:
-
                 last_error = e
-                error_text = str(e).lower()
 
-                temporary_error = (
-                    "503" in error_text
-                    or "unavailable" in error_text
-                    or "high demand" in error_text
-                    or "temporarily" in error_text
-                    or "429" in error_text
-                    or "resource_exhausted" in error_text
-                    or "resource exhausted" in error_text
-                    or "rate limit" in error_text
-                )
-
-                if temporary_error:
-                    print(
-                        f"Temporary Gemini error using "
-                        f"{model_name}, attempt {attempt + 1}: {e}"
-                    )
-
-                    # Small delay before retrying.
-                    if attempt == 0:
-                        time.sleep(1)
-
+                if _is_overloaded_error(e) and attempt < max_retries - 1:
+                    wait = (2 ** attempt) + random.uniform(0, 0.5)
+                    time.sleep(wait)
                     continue
 
-                # Authentication/model-format/programming errors
-                # should not silently move through all models.
-                raise
+                break  # give up on this model
 
-        # Current model failed twice.
-        # Continue with next fallback model.
+        if not _is_overloaded_error(last_error):
+            break  # non-overload error — no point trying the fallback model
 
-    print(f"All Gemini models failed: {last_error}")
-
-    raise RuntimeError(
-        "AI service is temporarily unavailable."
-    )
+    raise last_error
 
 
 # ==============================================================
-# CLEAN GEMINI JSON
+# HELPER — CLEAN GEMINI JSON
 # ==============================================================
 
 def clean_json_response(raw_text):
+    """
+    Removes possible markdown fences from Gemini output.
+    """
 
     if not raw_text:
         raise ValueError("Gemini returned an empty response.")
 
     raw_text = raw_text.strip()
 
-    # Remove markdown code fences if Gemini adds them.
     if raw_text.startswith("```"):
-
-        lines = raw_text.splitlines()
-
-        if lines and lines[0].strip().startswith("```"):
-            lines = lines[1:]
-
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-
-        raw_text = "\n".join(lines).strip()
-
-    # Remove accidental "json" prefix.
-    if raw_text.lower().startswith("json"):
-        raw_text = raw_text[4:].strip()
+        raw_text = raw_text.replace("```json", "")
+        raw_text = raw_text.replace("```JSON", "")
+        raw_text = raw_text.replace("```", "")
+        raw_text = raw_text.strip()
 
     return raw_text
 
@@ -201,76 +202,85 @@ def clean_json_response(raw_text):
 # ==============================================================
 
 def detect_food_with_gemini(image: Image.Image):
+    """
+    Detect food items from an uploaded/captured image.
 
-    if image.mode != "RGB":
+    Returns:
+        [
+            {
+                "item": str,
+                "count": int,
+                "serving": str
+            }
+        ]
+    """
+
+    if image.mode in ("RGBA", "P"):
         image = image.convert("RGB")
 
     prompt = """
-You are a food recognition assistant.
+You are a professional food-recognition and nutrition assistant.
 
-Analyze the supplied food image.
+Analyze the supplied image and identify ALL visible food items.
 
-Identify ALL clearly visible food items.
+For every food item:
 
-For each item:
+1. Give the most specific food name possible.
+   Examples:
+   - "scrambled eggs" instead of "eggs"
+   - "basmati rice" instead of "rice"
+   - "dal makhani" instead of "dal"
 
-1. Give the most specific reasonable food name.
-2. Count visible pieces or portions when possible.
-3. Estimate a realistic serving quantity suitable for a nutrition API.
+2. Count individual pieces or portions when possible.
+   Examples:
+   - 2 chapatis
+   - 3 samosas
+   - 4 idlis
+   - 1 bowl of dal
 
-Examples:
+3. Estimate a realistic serving quantity that can be sent
+   to a nutrition API.
 
-2 chapatis:
-{
-  "item": "chapati",
-  "count": 2,
-  "serving": "2 medium chapatis"
-}
-
-1 bowl dal:
-{
-  "item": "dal",
-  "count": 1,
-  "serving": "1 cup cooked dal"
-}
+Examples of serving strings:
+- "2 medium apples"
+- "1 cup cooked basmati rice"
+- "100g paneer"
+- "2 medium chapatis"
+- "1 slice vegetable pizza"
 
 IMPORTANT RULES:
 
-- Include all clearly visible foods.
+- Include all clearly visible food items.
 - Count multiple pieces of the same food.
-- Do not include plates, spoons, glasses, hands or background objects.
-- Do not invent foods that cannot reasonably be identified.
-- If uncertain between similar foods, use the most reasonable general name.
-- Return [] when no food is visible.
+- Ignore plates, cutlery, glasses, hands and background objects.
+- Do not invent food that cannot reasonably be seen.
+- Return [] if no food is visible.
 - Return ONLY valid JSON.
-- Do NOT return Markdown.
-- Do NOT provide explanations.
+- Do NOT use markdown.
+- Do NOT include explanations.
 
-Required format:
+Required JSON format:
 
 [
   {
     "item": "food name",
-    "count": 1,
-    "serving": "realistic serving"
+    "count": 2,
+    "serving": "2 medium food items"
   }
 ]
 """
 
-    response = generate_with_fallback(
-        [prompt, image]
-    )
+    response = generate_with_retry(contents=[prompt, image])
 
-    raw = clean_json_response(
-        response.text
-    )
+    if not response.text:
+        raise ValueError("Gemini returned an empty response.")
+
+    raw = clean_json_response(response.text)
 
     detected_foods = json.loads(raw)
 
     if not isinstance(detected_foods, list):
-        raise ValueError(
-            "Food detection response was not a list."
-        )
+        raise ValueError("Gemini response was not a JSON list.")
 
     cleaned_foods = []
 
@@ -288,15 +298,14 @@ Required format:
 
         try:
             count = int(count)
-
         except (ValueError, TypeError):
             count = 1
 
         cleaned_foods.append(
             {
-                "item": str(item).strip(),
+                "item": str(item),
                 "count": max(count, 1),
-                "serving": str(serving).strip()
+                "serving": str(serving)
             }
         )
 
@@ -304,10 +313,10 @@ Required format:
 
 
 # ==============================================================
-# NUTRITION — EDAMAM
+# NUTRITION — EDAMAM API
 # ==============================================================
 
-def get_nutrition(serving_query, display_name=None):
+def get_nutrition(serving_query: str, display_name: str = None):
 
     if display_name is None:
         display_name = serving_query
@@ -317,7 +326,7 @@ def get_nutrition(serving_query, display_name=None):
     params = {
         "app_id": EDAMAM_APP_ID,
         "app_key": EDAMAM_APP_KEY,
-        "ingr": serving_query
+        "ingr": serving_query,
     }
 
     try:
@@ -330,93 +339,101 @@ def get_nutrition(serving_query, display_name=None):
 
         response.raise_for_status()
 
-        data = response.json()
+        resp = response.json()
 
-        ingredients = data.get(
-            "ingredients",
-            []
-        )
+        ingredients = resp.get("ingredients", [])
 
         if not ingredients:
-
             st.warning(
-                f"⚠️ Nutrition information couldn't be found "
-                f"for **{serving_query}**."
+                f"⚠️ Nutrition information couldn't be found for "
+                f"**{serving_query}**."
             )
-
             return None
 
-        parsed = ingredients[0].get(
-            "parsed",
-            []
-        )
+        parsed = ingredients[0].get("parsed", [])
 
         if not parsed:
-
             st.warning(
-                f"⚠️ Nutrition information couldn't be understood "
-                f"for **{serving_query}**."
+                f"⚠️ Edamam couldn't understand: "
+                f"**{serving_query}**."
             )
-
             return None
 
-        nutrients = parsed[0].get(
-            "nutrients",
-            {}
-        )
+        nutrients = parsed[0].get("nutrients", {})
 
         calories = nutrients.get(
             "ENERC_KCAL", {}
-        ).get("quantity", 0) or 0
+        ).get("quantity", 0)
 
         protein = nutrients.get(
             "PROCNT", {}
-        ).get("quantity", 0) or 0
+        ).get("quantity", 0)
 
         carbs = nutrients.get(
             "CHOCDF", {}
-        ).get("quantity", 0) or 0
+        ).get("quantity", 0)
 
         fat = nutrients.get(
             "FAT", {}
-        ).get("quantity", 0) or 0
+        ).get("quantity", 0)
 
         fiber = nutrients.get(
             "FIBTG", {}
-        ).get("quantity", 0) or 0
+        ).get("quantity", 0)
 
-        # Escape user/API-generated text before inserting into HTML.
-        safe_display_name = html.escape(
-            str(display_name)
-        )
+        render_html(
+            f"""
+            <div style="
+                background-color:rgba(0,0,0,0.72);
+                padding:18px 22px;
+                border-radius:12px;
+                color:white;
+                margin-bottom:16px;
+                border-left:4px solid #f0a500;
+            ">
 
-        # IMPORTANT:
-        # HTML starts at the beginning of each line.
-        # This prevents Streamlit Markdown from treating it as code.
+                <h3 style="margin:0 0 10px 0;">
+                    🍴 {display_name}
+                </h3>
 
-        nutrition_html = f"""<div style="background-color:rgba(0,0,0,0.72);padding:18px 22px;border-radius:12px;color:white;margin-bottom:16px;border-left:4px solid #f0a500;">
-<h3 style="margin:0 0 10px 0;">🍴 {safe_display_name}</h3>
-<table style="width:100%;font-size:15px;border-collapse:collapse;">
-<tr><td style="padding:4px;">🔥 <b>Calories</b></td><td style="padding:4px;"><b>{calories:.1f} kcal</b></td></tr>
-<tr><td style="padding:4px;">💪 <b>Protein</b></td><td style="padding:4px;">{protein:.1f} g</td></tr>
-<tr><td style="padding:4px;">🌾 <b>Carbs</b></td><td style="padding:4px;">{carbs:.1f} g</td></tr>
-<tr><td style="padding:4px;">🧈 <b>Fat</b></td><td style="padding:4px;">{fat:.1f} g</td></tr>
-<tr><td style="padding:4px;">🌿 <b>Fiber</b></td><td style="padding:4px;">{fiber:.1f} g</td></tr>
-</table>
-</div>"""
+                <table style="width:100%; font-size:15px;">
 
-        st.markdown(
-            nutrition_html,
-            unsafe_allow_html=True
+                    <tr>
+                        <td>🔥 <b>Calories</b></td>
+                        <td><b>{calories:.1f} kcal</b></td>
+                    </tr>
+
+                    <tr>
+                        <td>💪 <b>Protein</b></td>
+                        <td>{protein:.1f} g</td>
+                    </tr>
+
+                    <tr>
+                        <td>🌾 <b>Carbs</b></td>
+                        <td>{carbs:.1f} g</td>
+                    </tr>
+
+                    <tr>
+                        <td>🧈 <b>Fat</b></td>
+                        <td>{fat:.1f} g</td>
+                    </tr>
+
+                    <tr>
+                        <td>🌿 <b>Fiber</b></td>
+                        <td>{fiber:.1f} g</td>
+                    </tr>
+
+                </table>
+
+            </div>
+            """
         )
 
         # ------------------------------------------------------
         # NUTRITION CHART
         # ------------------------------------------------------
 
-        fig, ax = plt.subplots(
-            figsize=(5, 2.5)
-        )
+        fig, ax = plt.subplots(figsize=(5, 2.5))
 
         fig.patch.set_alpha(0)
         ax.set_facecolor("none")
@@ -435,7 +452,16 @@ def get_nutrition(serving_query, display_name=None):
                 carbs,
                 fat,
                 fiber
-            ]
+            ],
+            color=[
+                "#f0a500",
+                "#4caf50",
+                "#2196f3",
+                "#f44336",
+                "#9c27b0"
+            ],
+            edgecolor="white",
+            linewidth=0.6,
         )
 
         ax.set_ylabel(
@@ -444,7 +470,7 @@ def get_nutrition(serving_query, display_name=None):
         )
 
         ax.set_title(
-            str(display_name),
+            display_name,
             color="white",
             fontsize=10
         )
@@ -462,49 +488,43 @@ def get_nutrition(serving_query, display_name=None):
         plt.close(fig)
 
         return {
-            "item": str(display_name),
-            "calories": float(calories),
-            "protein": float(protein),
-            "carbs": float(carbs),
-            "fat": float(fat),
-            "fiber": float(fiber)
+            "item": display_name,
+            "calories": calories,
+            "protein": protein,
+            "carbs": carbs,
+            "fat": fat,
+            "fiber": fiber,
         }
 
     except requests.exceptions.Timeout:
 
         st.error(
-            "❌ Nutrition service timed out. Please try again."
+            "❌ Nutrition API timed out. Please try again."
         )
 
         return None
 
     except requests.exceptions.RequestException as e:
 
-        print(f"Edamam request error: {e}")
-
         st.error(
-            "❌ Nutrition service is temporarily unavailable."
+            f"❌ Nutrition API error: {e}"
         )
 
         return None
 
-    except (KeyError, IndexError, TypeError, ValueError) as e:
-
-        print(f"Edamam response parsing error: {e}")
+    except (KeyError, IndexError, TypeError):
 
         st.warning(
-            f"⚠️ Nutrition information couldn't be calculated "
-            f"for **{serving_query}**."
+            f"⚠️ Edamam couldn't find nutrition for: "
+            f"**{serving_query}**."
         )
 
         return None
 
     except Exception as e:
 
-        print(f"Unexpected nutrition error: {e}")
-
         st.error(
-            "❌ Something went wrong while calculating nutrition."
+            f"❌ Unexpected nutrition error: {e}"
         )
 
         return None
@@ -514,12 +534,12 @@ def get_nutrition(serving_query, display_name=None):
 # MEAL SUMMARY
 # ==============================================================
 
-def show_meal_summary(nutrition_list):
+def show_meal_summary(nutrition_list: list):
 
     valid = [
-        item
-        for item in nutrition_list
-        if item
+        nutrition
+        for nutrition in nutrition_list
+        if nutrition
     ]
 
     if not valid:
@@ -527,8 +547,8 @@ def show_meal_summary(nutrition_list):
 
     total = {
         key: sum(
-            item.get(key, 0)
-            for item in valid
+            nutrition.get(key, 0)
+            for nutrition in valid
         )
         for key in (
             "calories",
@@ -539,26 +559,58 @@ def show_meal_summary(nutrition_list):
         )
     }
 
-    # No leading indentation -> avoids raw HTML rendering.
+    render_html(
+        f"""
+        <div style="
+            background-color:rgba(0,100,0,0.75);
+            padding:20px 24px;
+            border-radius:12px;
+            color:white;
+            margin:20px 0;
+            border-left:4px solid #00e676;
+        ">
 
-    summary_html = f"""<div style="background-color:rgba(0,100,0,0.75);padding:20px 24px;border-radius:12px;color:white;margin:20px 0;border-left:4px solid #00e676;">
-<h2 style="margin:0 0 12px 0;">📊 Total Meal Summary</h2>
-<table style="width:100%;font-size:16px;border-collapse:collapse;">
-<tr><td style="padding:5px;">🔥 <b>Total Calories</b></td><td style="padding:5px;"><b>{total['calories']:.1f} kcal</b></td></tr>
-<tr><td style="padding:5px;">💪 <b>Total Protein</b></td><td style="padding:5px;">{total['protein']:.1f} g</td></tr>
-<tr><td style="padding:5px;">🌾 <b>Total Carbs</b></td><td style="padding:5px;">{total['carbs']:.1f} g</td></tr>
-<tr><td style="padding:5px;">🧈 <b>Total Fat</b></td><td style="padding:5px;">{total['fat']:.1f} g</td></tr>
-<tr><td style="padding:5px;">🌿 <b>Total Fiber</b></td><td style="padding:5px;">{total['fiber']:.1f} g</td></tr>
-</table>
-</div>"""
+            <h2 style="margin:0 0 12px 0;">
+                📊 Total Meal Summary
+            </h2>
 
-    st.markdown(
-        summary_html,
-        unsafe_allow_html=True
+            <table style="width:100%; font-size:16px;">
+
+                <tr>
+                    <td>🔥 <b>Total Calories</b></td>
+                    <td>
+                        <b>{total['calories']:.1f} kcal</b>
+                    </td>
+                </tr>
+
+                <tr>
+                    <td>💪 <b>Total Protein</b></td>
+                    <td>{total['protein']:.1f} g</td>
+                </tr>
+
+                <tr>
+                    <td>🌾 <b>Total Carbs</b></td>
+                    <td>{total['carbs']:.1f} g</td>
+                </tr>
+
+                <tr>
+                    <td>🧈 <b>Total Fat</b></td>
+                    <td>{total['fat']:.1f} g</td>
+                </tr>
+
+                <tr>
+                    <td>🌿 <b>Total Fiber</b></td>
+                    <td>{total['fiber']:.1f} g</td>
+                </tr>
+
+            </table>
+
+        </div>
+        """
     )
 
     # ----------------------------------------------------------
-    # MACRO CHART
+    # MACRO PIE CHART
     # ----------------------------------------------------------
 
     labels = [
@@ -573,6 +625,12 @@ def show_meal_summary(nutrition_list):
         total["fat"]
     ]
 
+    colors = [
+        "#4caf50",
+        "#2196f3",
+        "#f44336"
+    ]
+
     if sum(sizes) > 0:
 
         fig, ax = plt.subplots(
@@ -582,15 +640,16 @@ def show_meal_summary(nutrition_list):
         fig.patch.set_alpha(0)
         ax.set_facecolor("none")
 
-        _, _, autotexts = ax.pie(
+        _, texts, autotexts = ax.pie(
             sizes,
             labels=labels,
+            colors=colors,
             autopct="%1.1f%%",
             startangle=90,
             textprops={
                 "color": "white",
                 "fontsize": 10
-            }
+            },
         )
 
         for text in autotexts:
@@ -610,51 +669,57 @@ def show_meal_summary(nutrition_list):
 
 
 # ==============================================================
-# PERSONALIZED / MEAL COMPLETION SUGGESTIONS
+# PERSONALIZED SUGGESTIONS — GEMINI
 # ==============================================================
 
-def suggest_additions(total, food_context):
+def suggest_additions(total: dict, food_context: str):
 
-    # These are general meal-completion thresholds,
-    # not personalized medical targets.
+    # ----------------------------------------------------------
+    # IDENTIFY NUTRITIONAL GAPS
+    # ----------------------------------------------------------
 
     gaps = []
 
     if total.get("calories", 0) < 300:
         gaps.append(
-            f"Energy is relatively low "
-            f"({total.get('calories', 0):.0f} kcal)."
+            f"Calories are low "
+            f"({total.get('calories', 0):.0f} kcal; "
+            f"meal target approximately 300+ kcal)."
         )
 
     if total.get("protein", 0) < 20:
         gaps.append(
-            f"Protein is relatively low "
-            f"({total.get('protein', 0):.1f} g)."
+            f"Protein is low "
+            f"({total.get('protein', 0):.1f} g; "
+            f"meal target approximately 20+ g)."
         )
 
     if total.get("fat", 0) < 10:
         gaps.append(
-            f"Healthy fat content is relatively low "
-            f"({total.get('fat', 0):.1f} g)."
+            f"Healthy fats are low "
+            f"({total.get('fat', 0):.1f} g; "
+            f"meal target approximately 10+ g)."
         )
 
     if total.get("carbs", 0) < 30:
         gaps.append(
-            f"Carbohydrate content is relatively low "
-            f"({total.get('carbs', 0):.1f} g)."
+            f"Carbohydrates are low "
+            f"({total.get('carbs', 0):.1f} g; "
+            f"meal target approximately 30+ g)."
         )
 
     if total.get("fiber", 0) < 5:
         gaps.append(
-            f"Fiber content is relatively low "
-            f"({total.get('fiber', 0):.1f} g)."
+            f"Fiber is low "
+            f"({total.get('fiber', 0):.1f} g; "
+            f"meal target approximately 5+ g)."
         )
 
     if not gaps:
 
         st.success(
-            "✅ This meal already has a good balance of the "
-            "nutrients measured by the app."
+            "✅ This meal appears reasonably balanced "
+            "for the nutrients being measured."
         )
 
         return
@@ -664,61 +729,84 @@ def suggest_additions(total, food_context):
         for gap in gaps
     )
 
-    prompt = f"""
-You are a food and nutrition assistant.
+    # ----------------------------------------------------------
+    # GEMINI PROMPT
+    # ----------------------------------------------------------
 
-The user entered or ate:
+    prompt = f"""
+You are a nutrition assistant.
+
+The user ate:
 
 {food_context}
 
-Current nutrition information suggests:
+Based on the available nutrition API data, these nutritional
+gaps were detected:
 
 {gap_text}
 
-Provide EXACTLY 3 to 5 practical foods that could complement
-the existing food or meal.
+Suggest EXACTLY 3 to 5 practical food additions.
 
-RULES:
+IMPORTANT:
 
-- These are general meal-completion suggestions, not medical advice.
-- Do not describe the user as deficient.
-- Suggestions must naturally complement the existing food.
-- Respect the apparent food category.
-- If the food appears vegetarian, prefer vegetarian additions.
-- If it appears vegan, prefer plant-based additions.
-- If the meal contains only fruit, suggest foods that pair naturally with fruit.
-- For Indian foods, prefer realistic Indian meal combinations where appropriate.
-- Address the nutrients listed above.
-- Keep each reason to one short sentence.
-- Return only JSON.
-- Do not use markdown.
+1. Suggestions should make sense with the existing meal.
 
-Return this exact structure:
+2. Respect the apparent food category.
+
+Examples:
+
+- If the meal contains only fruits, recommend fruit-compatible
+  foods such as yogurt, nuts, seeds or other appropriate foods.
+
+- If the meal appears vegetarian, do not randomly recommend meat.
+
+- If the meal appears vegan, prefer plant-based additions.
+
+- For Indian meals, prefer practical additions that naturally
+  complement the meal where appropriate.
+
+3. Prioritize the nutritional gaps listed above.
+
+4. Keep every reason short.
+
+5. Do not claim that these targets are personalized medical
+   requirements.
+
+6. Return between 3 and 5 suggestions.
+
+Return ONLY valid JSON.
+
+Do not include markdown fences.
+
+Required format:
 
 [
-  {
-    "suggestion": "Add whole-grain toast",
-    "reason": "Adds carbohydrates and fiber to complement the meal.",
-    "emoji": "🍞"
-  },
-  {
-    "suggestion": "Add a bowl of yogurt",
-    "reason": "Adds protein and pairs naturally with the meal.",
+  {{
+    "suggestion": "Add a small bowl of Greek yogurt",
+    "reason": "Adds protein and complements the existing meal.",
     "emoji": "🥛"
-  },
-  {
-    "suggestion": "Add a small serving of fruit",
-    "reason": "Adds carbohydrates and fiber.",
-    "emoji": "🍎"
-  }
+  }},
+  {{
+    "suggestion": "Add a handful of almonds",
+    "reason": "Adds healthy fats, protein and fiber.",
+    "emoji": "🌰"
+  }},
+  {{
+    "suggestion": "Add chia seeds",
+    "reason": "Provides fiber and healthy fats.",
+    "emoji": "🌱"
+  }}
 ]
 """
 
     try:
 
-        response = generate_with_fallback(
-            prompt
-        )
+        response = generate_with_retry(contents=prompt)
+
+        if not response.text:
+            raise ValueError(
+                "Gemini returned an empty response."
+            )
 
         raw_text = clean_json_response(
             response.text
@@ -730,12 +818,16 @@ Return this exact structure:
 
         if not isinstance(suggestions, list):
             raise ValueError(
-                "Suggestion response was not a list."
+                "Gemini response was not a JSON list."
             )
 
+        # Maximum 5 suggestions
+        suggestions = suggestions[:5]
+
+        # Validate suggestions
         valid_suggestions = []
 
-        for suggestion in suggestions[:5]:
+        for suggestion in suggestions:
 
             if not isinstance(suggestion, dict):
                 continue
@@ -748,11 +840,6 @@ Return this exact structure:
                 "reason"
             )
 
-            emoji = suggestion.get(
-                "emoji",
-                "🍴"
-            )
-
             if not title or not reason:
                 continue
 
@@ -760,111 +847,131 @@ Return this exact structure:
                 {
                     "suggestion": str(title),
                     "reason": str(reason),
-                    "emoji": str(emoji)
+                    "emoji": str(
+                        suggestion.get(
+                            "emoji",
+                            "🍴"
+                        )
+                    )
                 }
             )
 
         if not valid_suggestions:
             raise ValueError(
-                "No usable suggestions returned."
+                "Gemini didn't return usable suggestions."
             )
 
-        heading_html = """<div style="background-color:rgba(0,0,0,0.70);padding:16px 20px;border-radius:12px;color:white;margin:20px 0 10px 0;border-left:4px solid #ffeb3b;">
-<h3 style="margin:0;">💡 Suggested Additions</h3>
-</div>"""
+        # ------------------------------------------------------
+        # DISPLAY SUGGESTIONS
+        # ------------------------------------------------------
 
-        st.markdown(
-            heading_html,
-            unsafe_allow_html=True
+        render_html(
+            """
+            <div style="
+                background-color:rgba(0,0,0,0.70);
+                padding:16px 20px;
+                border-radius:12px;
+                color:white;
+                margin-bottom:10px;
+                border-left:4px solid #ffeb3b;
+            ">
+
+                <h3 style="margin:0;">
+                    💡 Personalized Suggestions
+                </h3>
+
+            </div>
+            """
         )
 
         for suggestion in valid_suggestions:
 
-            safe_emoji = html.escape(
-                suggestion["emoji"]
+            emoji = suggestion["emoji"]
+            title = suggestion["suggestion"]
+            reason = suggestion["reason"]
+
+            render_html(
+                f"""
+                <div style="
+                    margin:8px 0;
+                    padding:10px 14px;
+                    background:rgba(0,0,0,0.65);
+                    border-radius:8px;
+                    color:white;
+                ">
+
+                    <span style="font-size:18px;">
+                        {emoji}
+                    </span>
+
+                    <b>
+                        {title}
+                    </b>
+
+                    <br>
+
+                    <span style="
+                        font-size:13px;
+                        color:#ddd;
+                    ">
+                        {reason}
+                    </span>
+
+                </div>
+                """
             )
 
-            safe_title = html.escape(
-                suggestion["suggestion"]
-            )
-
-            safe_reason = html.escape(
-                suggestion["reason"]
-            )
-
-            card_html = f"""<div style="margin:8px 0;padding:12px 14px;background:rgba(0,0,0,0.65);border-radius:8px;color:white;">
-<span style="font-size:18px;">{safe_emoji}</span> <b>{safe_title}</b><br>
-<span style="font-size:13px;color:#ddd;">{safe_reason}</span>
-</div>"""
-
-            st.markdown(
-                card_html,
-                unsafe_allow_html=True
-            )
-
-    except json.JSONDecodeError as e:
-
-        print(
-            f"Gemini suggestion JSON error: {e}"
-        )
+    except json.JSONDecodeError:
 
         st.warning(
-            "⚠️ AI suggestions couldn't be formatted correctly. "
+            "⚠️ Gemini returned an unexpected response. "
             "Please try again."
         )
 
     except Exception as e:
 
-        error_text = str(e).lower()
+        error_message = str(e)
 
-        print(
-            f"Gemini suggestion error: {e}"
-        )
-
-        if (
-            "429" in error_text
-            or "quota" in error_text
-            or "resource_exhausted" in error_text
-            or "resource exhausted" in error_text
-        ):
+        if _is_overloaded_error(e):
 
             st.warning(
-                "⏳ AI request limit has been reached. "
-                "Please wait a moment and try again."
+                "⏳ Gemini is experiencing high demand right now "
+                "(we already retried a few times and tried a "
+                "backup model). Please wait a moment and try again."
             )
 
         elif (
-            "503" in error_text
-            or "unavailable" in error_text
-            or "high demand" in error_text
-            or "temporarily" in error_text
+            "429" in error_message
+            or "quota" in error_message.lower()
+            or "resource_exhausted" in error_message.lower()
         ):
 
             st.warning(
-                "⚠️ AI suggestions are temporarily busy. "
-                "Please try again shortly."
+                "⏳ Gemini API rate limit or quota reached. "
+                "Please wait and try again."
             )
 
         elif (
-            "api key" in error_text
-            or "api_key" in error_text
-            or "credentials" in error_text
+            "api key" in error_message.lower()
+            or "api_key" in error_message.lower()
+            or "credentials" in error_message.lower()
         ):
 
             st.error(
-                "❌ AI authentication failed. "
-                "Please check the app configuration."
+                "❌ Gemini authentication failed. "
+                "Check GEMINI_API_KEY in Streamlit Secrets."
             )
 
         else:
 
             st.warning(
-                "⚠️ Personalized suggestions are temporarily unavailable."
+                f"⚠️ Could not generate personalized "
+                f"suggestions: {error_message}"
             )
 
 
 # ==============================================================
-# APP HEADER
+# APP LAYOUT
 # ==============================================================
 
 st.title(
@@ -874,11 +981,6 @@ st.title(
 st.caption(
     "Snap your food, get the nutrition!"
 )
-
-
-# ==============================================================
-# INPUT METHOD
-# ==============================================================
 
 option = st.radio(
     "Choose Input Method:",
@@ -898,10 +1000,10 @@ if option == "🔍 Search Bar":
     food_item = st.text_input(
         "Enter food with quantity",
         placeholder=(
-            "e.g. '2 eggs', "
+            "e.g. '2 medium apples', "
             "'1 cup basmati rice', "
             "'100g paneer'"
-        )
+        ),
     )
 
     if st.button(
@@ -909,9 +1011,7 @@ if option == "🔍 Search Bar":
         type="primary"
     ):
 
-        food_item = food_item.strip()
-
-        if not food_item:
+        if not food_item.strip():
 
             st.warning(
                 "⚠️ Please enter a food item with quantity."
@@ -919,28 +1019,20 @@ if option == "🔍 Search Bar":
 
         else:
 
-            with st.spinner(
-                "🧪 Calculating nutrition..."
-            ):
-
-                nutrition = get_nutrition(
-                    food_item
-                )
+            nutrition = get_nutrition(
+                food_item
+            )
 
             if nutrition:
 
-                with st.spinner(
-                    "💡 Preparing suggestions..."
-                ):
-
-                    suggest_additions(
-                        nutrition,
-                        food_context=food_item
-                    )
+                suggest_additions(
+                    nutrition,
+                    food_context=food_item
+                )
 
 
 # ==============================================================
-# CAMERA / IMAGE UPLOAD
+# CAMERA / UPLOAD
 # ==============================================================
 
 elif option == "📸 Camera / Upload":
@@ -988,24 +1080,17 @@ elif option == "📸 Camera / Upload":
                 width=400
             )
 
-        except Exception as e:
-
-            print(
-                f"Image loading error: {e}"
-            )
+        except Exception:
 
             st.error(
-                "❌ This image couldn't be opened. "
-                "Please try another JPG, PNG or WebP image."
+                "❌ Could not open this image."
             )
 
             st.stop()
 
         # ------------------------------------------------------
-        # DETECT FOOD
+        # FOOD DETECTION
         # ------------------------------------------------------
-
-        detected_foods = []
 
         with st.spinner(
             "🤖 MealSnap AI is analysing your food..."
@@ -1013,86 +1098,84 @@ elif option == "📸 Camera / Upload":
 
             try:
 
-                detected_foods = detect_food_with_gemini(
-                    image
+                detected_foods = (
+                    detect_food_with_gemini(
+                        image
+                    )
                 )
 
-            except json.JSONDecodeError as e:
-
-                print(
-                    f"Food detection JSON error: {e}"
-                )
+            except json.JSONDecodeError:
 
                 st.error(
-                    "❌ Food recognition returned an unexpected "
-                    "response. Please try again."
+                    "❌ Gemini returned an unexpected "
+                    "food-detection response. Please try again."
                 )
+
+                detected_foods = []
 
             except Exception as e:
 
-                error_text = str(e).lower()
+                error_message = str(e)
 
-                print(
-                    f"Food detection error: {e}"
-                )
-
-                if (
-                    "429" in error_text
-                    or "quota" in error_text
-                    or "resource_exhausted" in error_text
-                ):
+                if _is_overloaded_error(e):
 
                     st.error(
-                        "⏳ AI request limit reached. "
-                        "Please wait a moment and retry."
+                        "⏳ Gemini is experiencing high demand "
+                        "right now (already retried and tried a "
+                        "backup model). Please wait and retry."
                     )
 
                 elif (
-                    "503" in error_text
-                    or "unavailable" in error_text
-                    or "high demand" in error_text
-                    or "temporarily" in error_text
+                    "429" in error_message
+                    or "quota" in error_message.lower()
+                    or "resource_exhausted"
+                    in error_message.lower()
                 ):
 
                     st.error(
-                        "⚠️ Food recognition is temporarily busy. "
-                        "Please try again shortly."
+                        "⏳ Gemini API rate limit or quota "
+                        "reached. Please wait and retry."
                     )
 
                 elif (
-                    "api key" in error_text
-                    or "api_key" in error_text
-                    or "credentials" in error_text
+                    "api key" in error_message.lower()
+                    or "api_key" in error_message.lower()
+                    or "credentials"
+                    in error_message.lower()
                 ):
 
                     st.error(
-                        "❌ AI authentication failed."
+                        "❌ Invalid Gemini API key. "
+                        "Check Streamlit Secrets."
                     )
 
                 else:
 
                     st.error(
-                        "❌ Food recognition couldn't be completed. "
-                        "Please try again."
+                        f"❌ Detection error: "
+                        f"{error_message}"
                     )
 
+                detected_foods = []
+
         # ------------------------------------------------------
-        # DETECTION RESULTS
+        # RESULTS
         # ------------------------------------------------------
 
         if not detected_foods:
 
             st.warning(
                 """
-⚠️ No food was detected.
+⚠️ No food detected.
 
-**Try the following:**
-- Make sure the food is clearly visible.
+Tips:
+
+- Ensure the food is clearly visible.
 - Use good lighting.
 - Avoid blurry images.
 - Capture the whole plate.
-- Try taking the photo from above.
-"""
+- Try taking the image from above.
+                """
             )
 
         else:
@@ -1103,31 +1186,43 @@ elif option == "📸 Camera / Upload":
 
             for food in detected_foods:
 
-                safe_item = html.escape(
-                    food["item"]
+                render_html(
+                    f"""
+                    <div style="
+                        background-color:rgba(0,0,0,0.60);
+                        padding:10px 16px;
+                        border-radius:8px;
+                        color:white;
+                        margin:5px 0;
+                        border-left:3px solid #f0a500;
+                    ">
+
+                        🍴 <b>
+                            {food['item']}
+                        </b>
+
+                        &nbsp;|&nbsp;
+
+                        Qty:
+                        <b>
+                            {food['count']}
+                        </b>
+
+                        &nbsp;|&nbsp;
+
+                        Serving:
+                        <i>
+                            {food['serving']}
+                        </i>
+
+                    </div>
+                    """
                 )
-
-                safe_serving = html.escape(
-                    food["serving"]
-                )
-
-                food_html = f"""<div style="background-color:rgba(0,0,0,0.60);padding:10px 16px;border-radius:8px;color:white;margin:5px 0;border-left:3px solid #f0a500;">
-🍴 <b>{safe_item}</b> &nbsp;|&nbsp; Qty: <b>{food['count']}</b> &nbsp;|&nbsp; Serving: <i>{safe_serving}</i>
-</div>"""
-
-                st.markdown(
-                    food_html,
-                    unsafe_allow_html=True
-                )
-
-            # --------------------------------------------------
-            # NUTRITION BREAKDOWN
-            # --------------------------------------------------
 
             st.markdown("---")
 
             st.markdown(
-                "### 🧪 Nutrition Breakdown"
+                "### 🧪 Nutrition Breakdown (per item)"
             )
 
             nutrition_results = []
@@ -1139,7 +1234,7 @@ elif option == "📸 Camera / Upload":
                     display_name=(
                         f"{food['count']}× "
                         f"{food['item']}"
-                    )
+                    ),
                 )
 
                 if result:
@@ -1148,7 +1243,7 @@ elif option == "📸 Camera / Upload":
                     )
 
             # --------------------------------------------------
-            # MEAL SUMMARY
+            # TOTAL
             # --------------------------------------------------
 
             if nutrition_results:
@@ -1162,24 +1257,22 @@ elif option == "📸 Camera / Upload":
                 if total:
 
                     food_context = ", ".join(
-                        f"{food['count']} {food['item']}"
-                        for food in detected_foods
+                        f"{food['count']} "
+                        f"{food['item']}"
+                        for food
+                        in detected_foods
                     )
 
-                    with st.spinner(
-                        "💡 Preparing meal suggestions..."
-                    ):
-
-                        suggest_additions(
-                            total,
-                            food_context=food_context
-                        )
+                    suggest_additions(
+                        total,
+                        food_context=food_context
+                    )
 
             else:
 
                 st.warning(
-                    "⚠️ Nutrition information couldn't be calculated "
-                    "for the detected foods."
+                    "⚠️ Nutrition information couldn't "
+                    "be calculated for the detected foods."
                 )
 
 
@@ -1187,24 +1280,27 @@ elif option == "📸 Camera / Upload":
 # DISCLAIMER
 # ==============================================================
 
-st.markdown("---")
+# st.markdown("---")
 
-st.caption(
-    "Nutrition values and AI food recognition are estimates. "
-    "Suggested additions are general information and should not "
-    "be treated as personalized medical or dietary advice."
-)
+# st.caption(
+#     "Nutrition values and AI food recognition are estimates. "
+#     "They should not be treated as medical or dietary advice."
+# )
 
 
 # ==============================================================
 # CREDITS
 # ==============================================================
 
-credits_html = """<div style="text-align:center;margin-top:30px;font-size:13px;color:grey;">
-© Made by <b>Pranjal Purohit</b>
-</div>"""
-
-st.markdown(
-    credits_html,
-    unsafe_allow_html=True
+render_html(
+    """
+    <div style="
+        text-align:center;
+        margin-top:30px;
+        font-size:13px;
+        color:grey;
+    ">
+        © Made by <b>Pranjal Purohit</b>
+    </div>
+    """
 )
