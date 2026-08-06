@@ -237,77 +237,108 @@ def show_meal_summary(nutrition_list: list):
 # PERSONALIZED SUGGESTIONS  — Gemini-powered, context-aware
 # ==============================================================
 def suggest_additions(total: dict, food_context: str):
-    """
-    Calls Gemini with the actual foods eaten + nutritional gaps to produce
-    suggestions that match the food category:
-      - fruit meal  → suggest fruits / fruit-compatible items
-      - veg meal    → suggest only vegetarian items
-      - non-veg     → any protein source is fair game
-      - etc.
-    food_context: plain-English description of what was eaten
-                  e.g. "2 apples, 1 banana" or "1 cup dal, 2 chapatis"
-    """
-    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
-    # gemini-2.5-flash is a "thinking" model — internal reasoning tokens are
-    # drawn from the SAME max_output_tokens budget, BEFORE the visible answer
-    # is written. If reasoning eats the whole budget, response.text comes back
-    # empty/blocked, which is why every call was failing. We try to disable
-    # thinking outright; if the installed SDK version doesn't support that yet,
-    # we fall back to a much larger token budget as a safety cushion.
-    try:
-        gen_config = genai.types.GenerationConfig(
-            temperature=0.7,
-            max_output_tokens=2048,
-            thinking_config=genai.types.ThinkingConfig(thinking_budget=0),
-        )
-    except (AttributeError, TypeError):
-        gen_config = genai.types.GenerationConfig(
-            temperature=0.7,
-            max_output_tokens=2048,
-        )
-
-    suggestion_model = genai.GenerativeModel(
-        model_name="gemini-2.5-flash",
-        generation_config=gen_config,
+    client = genai.Client(
+        api_key=st.secrets["GEMINI_API_KEY"]
     )
 
-    # Build a clear nutritional-gap summary for the prompt
+    # Build nutritional-gap summary
     gaps = []
+
     if total["calories"] < 300:
-        gaps.append(f"total calories are low ({total['calories']:.0f} kcal, target ≥ 300)")
+        gaps.append(
+            f"total calories are low "
+            f"({total['calories']:.0f} kcal, target ≥ 300)"
+        )
+
     if total["protein"] < 20:
-        gaps.append(f"protein is low ({total['protein']:.1f}g, target ≥ 20g)")
+        gaps.append(
+            f"protein is low "
+            f"({total['protein']:.1f}g, target ≥ 20g)"
+        )
+
     if total["fat"] < 10:
-        gaps.append(f"healthy fats are low ({total['fat']:.1f}g, target ≥ 10g)")
+        gaps.append(
+            f"healthy fats are low "
+            f"({total['fat']:.1f}g, target ≥ 10g)"
+        )
+
     if total["carbs"] < 30:
-        gaps.append(f"carbohydrates are low ({total['carbs']:.1f}g, target ≥ 30g)")
+        gaps.append(
+            f"carbohydrates are low "
+            f"({total['carbs']:.1f}g, target ≥ 30g)"
+        )
+
     if total["fiber"] < 5:
-        gaps.append(f"dietary fiber is low ({total['fiber']:.1f}g, target ≥ 5g)")
+        gaps.append(
+            f"dietary fiber is low "
+            f"({total['fiber']:.1f}g, target ≥ 5g)"
+        )
 
     if not gaps:
-        st.success("✅ Your meal looks well-balanced — no additions needed!")
+        st.success(
+            "✅ Your meal looks well-balanced — no additions needed!"
+        )
         return
 
     gap_text = "; ".join(gaps)
 
-    prompt = f"""A person just ate: {food_context}
+    prompt = f"""
+A person just ate: {food_context}
 
-Nutritional gaps in their meal: {gap_text}
+Nutritional gaps in their meal:
+{gap_text}
 
-Your task:
-1. Identify the food category of their meal (e.g. fruits only, vegetarian Indian, non-vegetarian, vegan, mixed, etc.)
-2. Suggest EXACTLY 3 to 5 specific additions (never fewer than 3, never more than 5) that:
-   - Belong to the SAME food category (e.g. if they ate only fruits, suggest fruits or foods naturally eaten with fruits like yogurt, nuts, seeds — NOT eggs, bread, or meat)
-   - Directly address the nutritional gaps listed above
-   - Are realistic and practical to add to that meal
-   - Include a SHORT reason why each helps — ONE sentence, under 15 words, to keep the response compact
+Suggest EXACTLY 3 to 5 specific food additions.
 
-Respond with ONLY the JSON array below. No reasoning, no explanation, no markdown fences, no text before or after:
+Requirements:
+- Keep suggestions compatible with the meal.
+- Directly address the nutritional gaps.
+- Give one short reason for each suggestion.
+
+Return ONLY valid JSON:
+
 [
-  {{"suggestion": "Add a handful of almonds", "reason": "Rich in healthy fats, complements a fruit meal.", "emoji": "🌰"}},
-  {{"suggestion": "Add a small bowl of Greek yogurt", "reason": "Pairs well with fruit and adds 10g protein.", "emoji": "🥛"}}
-]"""
+  {{
+    "suggestion": "Add a handful of almonds",
+    "reason": "Provides healthy fats and additional protein.",
+    "emoji": "🌰"
+  }}
+]
+"""
+
+    try:
+        response = client.models.generate_content(
+            model="YOUR_AVAILABLE_MODEL",
+            contents=prompt
+        )
+
+        raw_text = response.text.strip()
+
+        if raw_text.startswith("```"):
+            raw_text = raw_text.replace("```json", "")
+            raw_text = raw_text.replace("```", "")
+            raw_text = raw_text.strip()
+
+        suggestions = json.loads(raw_text)
+
+        st.markdown("### 💡 Personalized Suggestions")
+
+        for s in suggestions[:5]:
+            emoji = s.get("emoji", "🍴")
+
+            st.markdown(
+                f"""
+                **{emoji} {s['suggestion']}**
+
+                {s['reason']}
+                """
+            )
+
+    except Exception as e:
+        st.warning(
+            f"⚠️ Could not generate personalized suggestions: {e}"
+        )
 
     def get_response_text(response):
         """Safely pull text out of a response, with a clear reason if it's missing."""
