@@ -44,7 +44,7 @@ add_bg_from_local("bg.png")
 # ==============================================================
 # API KEYS
 # ==============================================================
-GOOGLE_API_KEY = "AIzaSyDZEZ6nvCIK4agZBwj8YqX4lHQ68R-5p8Q"
+GOOGLE_API_KEY = "AQ.Ab8RN6Lz6dnW4qUABnM5Av_DJ_FqhAtsGZS9U72nJKPiRdLznQ"
 EDAMAM_APP_ID  = "e9755876"
 EDAMAM_APP_KEY = "49fa98e3b702be8cf3bd51d5ffdc5a67"
 
