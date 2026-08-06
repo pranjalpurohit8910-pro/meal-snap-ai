@@ -3,7 +3,7 @@ import requests
 import pandas as pd
 import matplotlib.pyplot as plt
 import base64
-import google.generativeai as genai
+from google import genai
 import json
 import os
 from PIL import Image
@@ -247,7 +247,7 @@ def suggest_additions(total: dict, food_context: str):
     food_context: plain-English description of what was eaten
                   e.g. "2 apples, 1 banana" or "1 cup dal, 2 chapatis"
     """
-    genai.configure(api_key=GOOGLE_API_KEY)
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
     # gemini-2.5-flash is a "thinking" model — internal reasoning tokens are
     # drawn from the SAME max_output_tokens budget, BEFORE the visible answer
@@ -442,12 +442,8 @@ elif option == "📸 Camera / Upload":
         image = Image.open(uploaded_img)
         st.image(image, caption="Your food image", use_container_width=False, width=400)
 
-        if GOOGLE_API_KEY == "your_google_api_key_here":
-            st.error(
-                "❌ Google API key not set.  \n"
-                "Get a **free** key → https://aistudio.google.com/app/apikey  \n"
-                "Then run: `export GOOGLE_API_KEY='AIza...'`"
-            )
+        if "GEMINI_API_KEY" not in st.secrets:
+            st.error("❌ Gemini API key is not configured.")
             st.stop()
 
         with st.spinner("🤖 Meal Snap AI is analysing your food..."):
